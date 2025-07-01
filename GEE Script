@@ -1,0 +1,354 @@
+/**********************************************************
+ Mumbai NDVI/NDWI/NBR Monthly Extraction – FIXED VERSION
+ Fixes: Empty bands, safe median, safe index computation
+**********************************************************/
+
+var greenspaces = ee.FeatureCollection("projects/ndvi123-460903/assets/mumbai_greenzones_with_mangroves_final");
+Map.centerObject(greenspaces, 11);
+Map.addLayer(greenspaces, {color: 'green'}, 'Mumbai Green Zones');
+
+// Index function with band safety
+function addIndices(image) {
+  var ndvi = image.normalizedDifference(['B8', 'B4']).rename('NDVI');
+  var ndwi = image.normalizedDifference(['B3', 'B8']).rename('NDWI');
+  var nbr  = image.normalizedDifference(['B8', 'B12']).rename('NBR');
+  return image.addBands([ndvi, ndwi, nbr]);
+}
+
+// Sentinel-2 loading
+var s2 = ee.ImageCollection("COPERNICUS/S2_SR")
+  .filterBounds(greenspaces)
+  .filterDate('2018-01-01', '2023-12-31')
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 60))
+  .select(['B3', 'B4', 'B8', 'B12'])
+  .map(function(img) {
+    return img.divide(10000).copyProperties(img, ['system:time_start']);
+  });
+
+var start = ee.Date('2018-01-01');
+var end = ee.Date('2023-12-31');
+var months = ee.List.sequence(0, end.difference(start, 'month').subtract(1));
+
+// Loop over months safely
+var monthlyStats = ee.FeatureCollection(
+  months.map(function(m) {
+    var date = start.advance(m, 'month');
+    var monthlyImages = s2.filterDate(date, date.advance(1, 'month'));
+    var count = monthlyImages.size();
+
+    return ee.Algorithms.If(
+      count.gt(0),
+      addIndices(monthlyImages.median())
+        .reduceRegions({
+          collection: greenspaces,
+          reducer: ee.Reducer.mean(),
+          scale: 10
+        })
+        .map(function(f) {
+          return f.set('date', date.format('YYYY-MM'));
+        }),
+      ee.FeatureCollection([])
+    );
+  })
+).flatten();
+
+// Export to Drive
+Export.table.toDrive({
+  collection: monthlyStats.filter(ee.Filter.notNull(['NDVI'])),
+  description: 'Mumbai_Greenzones_Indices_Final',
+  fileFormat: 'CSV'
+});
+/**********************************************************
+ NDVI/NDWI/NBR Monthly Median Extraction — Manila Green Zones (Final)
+ Author: Architesh Panda
+ Date: June 2025
+**********************************************************/
+
+// 1. Load uploaded OSM green zones
+var osmGreens = ee.FeatureCollection("projects/ndvi123-460903/assets/manil_green");
+
+// 2. Load ESA WorldCover 2020 and extract mangroves (Class 95)
+var worldcover = ee.Image("ESA/WorldCover/v100/2020");
+var mangroves = worldcover.eq(95).selfMask();
+
+var manilaBounds = ee.Geometry.Rectangle([120.9, 14.3, 121.1, 14.8]);
+
+var mangroveVectors = mangroves.reduceToVectors({
+  geometry: manilaBounds,
+  geometryType: 'polygon',
+  reducer: ee.Reducer.countEvery(),
+  scale: 10,
+  maxPixels: 1e10
+}).map(function(f) {
+  return f.set('zone_type', 'mangrove');
+});
+
+// 3. Merge OSM green zones with ESA mangroves
+var allZones = osmGreens.map(function(f) {
+  return f.set('zone_type', f.get('zone_conve'));  // assuming you renamed categories in QGIS
+}).merge(mangroveVectors);
+
+// 4. Vegetation index calculation
+function addIndices(img) {
+  var ndvi = img.normalizedDifference(['B8', 'B4']).rename('NDVI');
+  var ndwi = img.normalizedDifference(['B3', 'B8']).rename('NDWI');
+  var nbr  = img.normalizedDifference(['B8', 'B12']).rename('NBR');
+  return img.addBands([ndvi, ndwi, nbr]);
+}
+
+// 5. Define time steps
+var start = ee.Date('2018-01-01');
+var end = ee.Date('2023-12-31');
+var months = ee.List.sequence(0, end.difference(start, 'month').subtract(1));
+var selectedBands = ['B3', 'B4', 'B8', 'B12'];
+
+// 6. Extract monthly vegetation stats
+var monthlyStats = ee.FeatureCollection(
+  months.map(function(m) {
+    var date = start.advance(m, 'month');
+
+    var images = ee.ImageCollection("COPERNICUS/S2_SR")
+      .filterBounds(manilaBounds)
+      .filterDate(date, date.advance(1, 'month'))
+      .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 60))
+      .map(function(img) {
+        return img
+          .select(selectedBands)
+          .divide(10000)
+          .copyProperties(img, ['system:time_start']);
+      });
+
+    var count = images.size();
+
+    return ee.Algorithms.If(
+      count.gt(0),
+      addIndices(images.median())
+        .reduceRegions({
+          collection: allZones.map(function(f) {
+            return f.setGeometry(f.geometry().simplify(10));
+          }),
+          reducer: ee.Reducer.mean(),
+          scale: 10
+        }).map(function(f) {
+          return f.set('date', date.format('YYYY-MM'));
+        }),
+      ee.FeatureCollection([])
+    );
+  })
+).flatten();
+
+// 7. Export results to Google Drive
+Export.table.toDrive({
+  collection: monthlyStats.filter(ee.Filter.notNull(['NDVI'])),
+  description: 'Manila_Greenzones_Complete_NDVI',
+  fileFormat: 'CSV'
+});
+
+// Optional: Inspect a sample
+print('Sample zone:', allZones.first());
+Export.table.toDrive({
+  collection: allZones,
+  description: 'Manila_Greenzones_AllZones_GeoJSON',
+  fileFormat: 'GeoJSON'
+});
+
+/**********************************************************
+ NDVI-Based Parametric Insurance — Jakarta Green Zones
+ Author: Architesh Panda
+ Description:
+ Loads OSM-derived green zones from shapefile,
+ extracts mangroves from ESA WorldCover,
+ and merges them for NDVI analysis.
+
+ Requirements:
+ - Uploaded shapefile to GEE assets
+ - Access to ESA WorldCover 2020
+**********************************************************/
+
+// ------------------------------------
+// 1. Load uploaded Jakarta green zones
+// ------------------------------------
+var greenspaces = ee.FeatureCollection("projects/ndvi123-460903/assets/jakarta_greenzones_cleaned");
+
+// ------------------------------------
+// 2. Load ESA WorldCover and extract mangroves
+// ------------------------------------
+var worldcover = ee.Image("ESA/WorldCover/v100/2020");  // use 2020, not 2021
+var mangroves = worldcover.eq(95).selfMask();  // Class 95 = Mangroves
+
+// Convert raster mangroves to vector polygons
+var mangroveVectors = mangroves.reduceToVectors({
+  geometry: ee.Geometry.Rectangle([106.7, -6.4, 107.0, -6.05]),  // Jakarta bounding box
+  geometryType: 'polygon',
+  reducer: ee.Reducer.countEvery(),
+  scale: 10,
+  maxPixels: 1e10
+}).map(function(f) {
+  return f.set('zone_type', 'mangrove');
+});
+// ------------------------------------
+// 3. Merge green zones + mangroves
+// ------------------------------------
+var allZones = greenspaces.merge(mangroveVectors);
+
+// ------------------------------------
+// 4. Visualize on the map
+// ------------------------------------
+Map.setCenter(106.82, -6.2, 11);  // Manual center on Jakarta
+
+Map.addLayer(greenspaces, {color: 'green'}, 'Jakarta OSM Green Zones');
+Map.addLayer(mangroveVectors, {color: 'blue'}, 'Mangroves (ESA)');
+Map.addLayer(allZones, {}, 'All Jakarta Zones (Merged)');
+
+/**********************************************************
+ NDVI/NDWI/NBR Monthly Median Extraction — Jakarta Green Zones
+ Author: Architesh Panda
+ Date: June 2025
+ Description:
+ Computes monthly medians of NDVI, NDWI, and NBR for each green zone
+ in Jakarta using Sentinel-2 imagery from 2018 to 2023.
+**********************************************************/
+
+/**********************************************************
+ NDVI/NDWI/NBR Monthly Median Extraction — Jakarta Green Zones
+ Final Fixed Version (no geometry() calls)
+**********************************************************/
+
+// 1. Merged green zones
+var allZones = greenspaces.merge(mangroveVectors);
+
+// 2. Vegetation index calculation
+function addIndices(img) {
+  var ndvi = img.normalizedDifference(['B8', 'B4']).rename('NDVI');
+  var ndwi = img.normalizedDifference(['B3', 'B8']).rename('NDWI');
+  var nbr  = img.normalizedDifference(['B8', 'B12']).rename('NBR');
+  return img.addBands([ndvi, ndwi, nbr]);
+}
+
+// 3. Jakarta bounding box (avoids complex geometry issues)
+var jakartaBounds = ee.Geometry.Rectangle([106.7, -6.4, 107.0, -6.05]);
+
+// 4. Time range and monthly loop
+var start = ee.Date('2018-01-01');
+var end = ee.Date('2023-12-31');
+var months = ee.List.sequence(0, end.difference(start, 'month').subtract(1));
+var selectedBands = ['B3', 'B4', 'B8', 'B12'];
+
+// 5. Monthly NDVI/NDWI/NBR extraction
+var monthlyStats = ee.FeatureCollection(
+  months.map(function(m) {
+    var date = start.advance(m, 'month');
+
+    var images = ee.ImageCollection("COPERNICUS/S2_SR")
+      .filterBounds(jakartaBounds)  // safer than allZones.geometry()
+      .filterDate(date, date.advance(1, 'month'))
+      .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 60))
+      .map(function(img) {
+        return img
+          .select(selectedBands)
+          .divide(10000)
+          .copyProperties(img, ['system:time_start']);
+      });
+
+    var count = images.size();
+
+    return ee.Algorithms.If(
+      count.gt(0),
+      addIndices(images.median())
+        .reduceRegions({
+          collection: allZones.map(function(f) {
+            return f.setGeometry(f.geometry().simplify(10));  // clean geometries
+          }),
+          reducer: ee.Reducer.mean(),
+          scale: 10
+        }).map(function(f) {
+          return f.set('date', date.format('YYYY-MM'));
+        }),
+      ee.FeatureCollection([])
+    );
+  })
+).flatten();
+
+// 6. Export to Google Drive
+Export.table.toDrive({
+  collection: monthlyStats.filter(ee.Filter.notNull(['NDVI'])),
+  description: 'Jakarta_Greenzones_NDVI_NDWI_NBR_Monthly',
+  fileFormat: 'CSV'
+});
+
+// 7. Export merged green zones (geometry) to Google Drive for QGIS use
+Export.table.toDrive({
+  collection: allZones,
+  description: 'Jakarta_MergedGreenzones_GEOJSON',
+  fileFormat: 'GeoJSON'
+});
+/**********************************************************
+ NDVI/NDWI/NBR Monthly Median Extraction — Nairobi Green Zones
+ Author: Architesh Panda
+ Date: June 2025
+ Description:
+ Extracts monthly medians of NDVI, NDWI, and NBR from Sentinel-2
+ for pre-identified Nairobi green zones (2018–2023).
+**********************************************************/
+
+// 1. Load green zone shapefile
+var greenspaces = ee.FeatureCollection("projects/ndvi123-460903/assets/nairobi_cleaned_shp");
+
+// 2. Define vegetation indices
+function addIndices(img) {
+  var ndvi = img.normalizedDifference(['B8', 'B4']).rename('NDVI');
+  var ndwi = img.normalizedDifference(['B3', 'B8']).rename('NDWI');
+  var nbr  = img.normalizedDifference(['B8', 'B12']).rename('NBR');
+  return img.addBands([ndvi, ndwi, nbr]);
+}
+
+// 3. Define Nairobi bounding box to reduce geometry errors
+var nairobiBounds = ee.Geometry.Rectangle([36.7, -1.5, 37.1, -1.1]);  // approximate bounds
+
+// 4. Date range setup
+var start = ee.Date('2018-01-01');
+var end = ee.Date('2023-12-31');
+var months = ee.List.sequence(0, end.difference(start, 'month').subtract(1));
+var selectedBands = ['B3', 'B4', 'B8', 'B12'];
+
+// 5. NDVI/NDWI/NBR monthly extraction loop
+var monthlyStats = ee.FeatureCollection(
+  months.map(function(m) {
+    var date = start.advance(m, 'month');
+
+    var images = ee.ImageCollection("COPERNICUS/S2_SR")
+      .filterBounds(nairobiBounds)
+      .filterDate(date, date.advance(1, 'month'))
+      .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 60))
+      .map(function(img) {
+        return img
+          .select(selectedBands)
+          .divide(10000)
+          .copyProperties(img, ['system:time_start']);
+      });
+
+    var count = images.size();
+
+    return ee.Algorithms.If(
+      count.gt(0),
+      addIndices(images.median())
+        .reduceRegions({
+          collection: greenspaces.map(function(f) {
+            return f.setGeometry(f.geometry().simplify(10));
+          }),
+          reducer: ee.Reducer.mean(),
+          scale: 10
+        }).map(function(f) {
+          return f.set('date', date.format('YYYY-MM'));
+        }),
+      ee.FeatureCollection([])
+    );
+  })
+).flatten();
+
+// 6. Export to Google Drive
+Export.table.toDrive({
+  collection: monthlyStats.filter(ee.Filter.notNull(['NDVI'])),
+  description: 'Nairobi_Greenzones_NDVI_NDWI_NBR_Monthly',
+  fileFormat: 'CSV'
+});
